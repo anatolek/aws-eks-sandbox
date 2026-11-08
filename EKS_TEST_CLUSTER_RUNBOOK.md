@@ -18,6 +18,7 @@ names use the `l7-` prefix.
 - [10. Install other components](#10-install-other-components)
 - [11. Deploy nginx with Helm](#11-deploy-nginx-with-helm)
 - [12. Verify](#12-verify)
+- [13. Clean up](#13-clean-up)
 
 ## 1. Configure variables
 
@@ -125,6 +126,11 @@ aws ec2 authorize-security-group-ingress \
   --region "$AWS_REGION" \
   --group-id "$NODE_SG_ID" \
   --ip-permissions "IpProtocol=tcp,FromPort=9443,ToPort=9443,UserIdGroupPairs=[{GroupId=$CLUSTER_SG_ID,Description='EKS control plane to AWS Load Balancer Controller webhook'}]"
+
+aws ec2 create-tags \
+  --region "$AWS_REGION" \
+  --resources "$NODE_SG_ID" \
+  --tags "Key=kubernetes.io/cluster/$CLUSTER_NAME,Value=shared"
 
 aws ec2 create-launch-template \
   --region "$AWS_REGION" \
@@ -360,3 +366,184 @@ aws elbv2 describe-load-balancers \
   --query 'LoadBalancers[*].[LoadBalancerName,State.Code,Scheme,DNSName]' \
   --output table
 ```
+
+## 13. ## Clean up
+
+Run the following commands before deleting the VPC. They remove resources created by this runbook that can prevent VPC deletion.
+
+Load the environment variables:
+
+```bash
+source scripts/l7-eks-env.sh
+```
+
+### 1. Remove nginx and its Network Load Balancer
+
+Capture the NLB ARN before uninstalling nginx:
+
+```bash
+export NLB_ARN="$(aws elbv2 describe-load-balancers \
+  --region "$AWS_REGION" \
+  --names "${PREFIX}nginx" \
+  --query 'LoadBalancers[0].LoadBalancerArn' \
+  --output text 2>/dev/null || true)"
+```
+
+Uninstall the Helm release and wait for AWS to delete the NLB:
+
+```bash
+helm uninstall l7-nginx --namespace l7-nginx
+```
+
+### 2. Delete the EKS managed node group
+
+This terminates the EC2 instances belonging to the managed node group:
+
+```bash
+aws eks delete-nodegroup \
+  --region "$AWS_REGION" \
+  --cluster-name "$CLUSTER_NAME" \
+  --nodegroup-name "$NODE_GROUP_NAME"
+
+aws eks wait nodegroup-deleted \
+  --region "$AWS_REGION" \
+  --cluster-name "$CLUSTER_NAME" \
+  --nodegroup-name "$NODE_GROUP_NAME"
+```
+
+### 3. Remove the IAM OIDC provider
+
+```bash
+export OIDC_PROVIDER="$(aws eks describe-cluster \
+  --region "$AWS_REGION" \
+  --name "$CLUSTER_NAME" \
+  --query 'cluster.identity.oidc.issuer' \
+  --output text | sed 's|^https://||')"
+
+export OIDC_PROVIDER_ARN="$(aws iam list-open-id-connect-providers \
+  --query 'OpenIDConnectProviderList[].Arn' \
+  --output text | tr '\t' '\n' | grep -F "/${OIDC_PROVIDER}" || true)"
+
+if [ -n "$OIDC_PROVIDER_ARN" ]; then
+  aws iam delete-open-id-connect-provider \
+    --open-id-connect-provider-arn "$OIDC_PROVIDER_ARN"
+fi
+```
+
+### 4. Delete the EKS cluster
+
+```bash
+aws eks delete-cluster \
+  --region "$AWS_REGION" \
+  --name "$CLUSTER_NAME"
+
+aws eks wait cluster-deleted \
+  --region "$AWS_REGION" \
+  --name "$CLUSTER_NAME"
+```
+
+### 5. Delete IAM roles and policies
+
+Delete the AWS Load Balancer Controller role and its custom policy:
+
+```bash
+export LBC_POLICY_ARN="$(aws iam list-policies \
+  --scope Local \
+  --query "Policies[?PolicyName=='${LBC_POLICY_NAME}'].Arn | [0]" \
+  --output text)"
+
+aws iam detach-role-policy \
+  --role-name "$LBC_ROLE_NAME" \
+  --policy-arn "$LBC_POLICY_ARN"
+
+aws iam delete-role --role-name "$LBC_ROLE_NAME"
+
+aws iam delete-policy --policy-arn "$LBC_POLICY_ARN"
+```
+
+Delete the EKS node role:
+
+```bash
+aws iam detach-role-policy \
+  --role-name "$NODE_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+
+aws iam detach-role-policy \
+  --role-name "$NODE_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+
+aws iam detach-role-policy \
+  --role-name "$NODE_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+
+aws iam delete-role --role-name "$NODE_ROLE_NAME"
+```
+
+Delete the EKS cluster role:
+
+```bash
+aws iam detach-role-policy \
+  --role-name "$CLUSTER_ROLE_NAME" \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+aws iam delete-role --role-name "$CLUSTER_ROLE_NAME"
+```
+
+### 6. Delete the EC2 launch template and security groups
+
+```bash
+aws ec2 delete-launch-template \
+  --region "$AWS_REGION" \
+  --launch-template-name "$NODE_LAUNCH_TEMPLATE_NAME"
+```
+
+Remove security group references before deleting the groups:
+
+```bash
+export CLUSTER_SG_ID="$(aws ec2 describe-security-groups \
+  --region "$AWS_REGION" \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+            "Name=group-name,Values=$CLUSTER_SG_NAME" \
+  --query 'SecurityGroups[0].GroupId' --output text)"
+
+export NODE_SG_ID="$(aws ec2 describe-security-groups \
+  --region "$AWS_REGION" \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+            "Name=group-name,Values=$NODE_SG_NAME" \
+  --query 'SecurityGroups[0].GroupId' --output text)"
+
+aws ec2 revoke-security-group-ingress \
+  --region "$AWS_REGION" \
+  --group-id "$CLUSTER_SG_ID" \
+  --protocol tcp --port 443 \
+  --source-group "$NODE_SG_ID"
+
+aws ec2 delete-security-group \
+  --region "$AWS_REGION" \
+  --group-id "$NODE_SG_ID"
+
+aws ec2 delete-security-group \
+  --region "$AWS_REGION" \
+  --group-id "$CLUSTER_SG_ID"
+```
+
+### 7. Verify and delete the VPC
+
+Check for remaining EC2 instances and network interfaces:
+
+```bash
+aws ec2 describe-instances \
+  --region "$AWS_REGION" \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+            "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+  --query 'Reservations[].Instances[].[InstanceId,State.Name]' \
+  --output table
+
+aws ec2 describe-network-interfaces \
+  --region "$AWS_REGION" \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,Status,Description]' \
+  --output table
+```
+
+Once all remaining dependencies are removed, **destroy the VPC** infrastructure using Terraform or delete it manually.
